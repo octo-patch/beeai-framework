@@ -1,14 +1,16 @@
 # Copyright 2025 © BeeAI a Series of LF Projects, LLC
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import re
 import time
+import weakref
 from collections.abc import Callable
 from typing import Any
 
 import pytest
 
-from beeai_framework.emitter import EmitterOptions
+from beeai_framework.emitter import EmitterOptions, EventTrace
 from beeai_framework.emitter.emitter import Emitter, EventMeta
 from beeai_framework.emitter.errors import EmitterError
 
@@ -31,6 +33,26 @@ def test_root_initialization() -> None:
     assert emitter is Emitter.root()  # caching
     assert emitter.creator is not None
     assert emitter.namespace == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("match_nested", [None, False, True])
+async def test_pipe_filters_descendant_runs_unless_requested(match_nested: bool | None) -> None:
+    source = Emitter(trace=EventTrace(id="group", run_id="parent"))
+    child = source.child(trace=EventTrace(id="group", run_id="child", parent_run_id="parent"))
+    target = Emitter()
+    received: list[str] = []
+    target.on("*.*", lambda data, _: received.append(data))
+    if match_nested is None:
+        source.pipe(target)
+    else:
+        source.pipe(target, match_nested=match_nested)
+
+    await source.emit("update", "parent")
+    await child.emit("update", "child")
+
+    assert received == (["parent", "child"] if match_nested else ["parent"])
 
 
 @pytest.mark.unit
@@ -376,3 +398,36 @@ def test_parent_destroy_cleans_up_all_children() -> None:
     child2.destroy()
     assert len(child1._cleanups) == 0
     assert len(child2._cleanups) == 0
+
+
+@pytest.mark.unit
+def test_child_emitter_does_not_keep_its_creator_alive() -> None:
+    class Creator:
+        emitter: Emitter
+
+    parent = Emitter.root().child(namespace=["parent"])
+    initial_cleanups = len(parent._cleanups)
+    creator = Creator()
+    creator.emitter = parent.child(namespace=["child"], creator=creator)  # the same cycle as a tool and its emitter
+    creator_ref = weakref.ref(creator)
+
+    del creator
+    gc.collect()
+
+    assert creator_ref() is None
+    assert len(parent._cleanups) == initial_cleanups
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_parent_destroy_detaches_live_children() -> None:
+    parent = Emitter.root().child(namespace=["parent"])
+    child = parent.child(namespace=["child"])
+    received: list[str] = []
+    parent.on("*.*", lambda _, event: received.append(event.name))
+
+    await child.emit("before", None)
+    parent.destroy()
+
+    assert received == ["before"]
+    assert child._listeners == []

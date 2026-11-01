@@ -8,6 +8,7 @@ import functools
 import inspect
 import re
 import uuid
+import weakref
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, TypeAlias, overload
@@ -103,13 +104,26 @@ class Emitter:
             events=events or self.events,
         )
 
-        cleanup = child_emitter.pipe(self)
+        child_emitter.pipe(self)
+
+        # The child keeps the parent alive through the pipe, but the parent refers to the child only weakly.
+        # Otherwise the parent (usually Emitter.root()) keeps every child and its creator alive forever.
+        def cleanup() -> None:
+            if (child := child_ref()) is not None:
+                child.off("*.*", self._invoke)
+
+        def remove_cleanup(_: object = None) -> None:
+            if cleanup in self._cleanups:
+                self._cleanups.remove(cleanup)
+
+        child_ref = weakref.ref(child_emitter, remove_cleanup)
         self._cleanups.append(cleanup)
-        child_emitter._cleanups.append(lambda: self._cleanups.remove(cleanup) if cleanup in self._cleanups else None)
+        child_emitter._cleanups.append(remove_cleanup)
 
         return child_emitter
 
-    def pipe(self, target: "Emitter") -> CleanupFn:
+    def pipe(self, target: "Emitter", *, match_nested: bool = False) -> CleanupFn:
+        """Forward events to a target, optionally including descendant runs."""
         return self.on(
             "*.*",
             target._invoke,
@@ -117,13 +131,13 @@ class Emitter:
                 is_blocking=True,
                 once=False,
                 persistent=True,
-                match_nested=False,
+                match_nested=match_nested,
             ),
         )
 
     def destroy(self) -> None:
         self._listeners.clear()
-        for cleanup in self._cleanups:
+        for cleanup in list(self._cleanups):  # a collected child removes its entry, even during this loop
             cleanup()
         self._cleanups.clear()
 
